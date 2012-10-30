@@ -1,16 +1,13 @@
 /*
- * linux/arch/arm/mach-pxa/etablet.c
+ * arch/arm/mach-pxa/etablet.c
  *
  * Support for the ASUS EeeNote EA-800 platform
- * 
  *
+ * Copyright (C) 2012 Roman Dobrodiy
  *
- * 2012-01-03: Roman Dobrodiy <ztcoils@gmail.com>
- *             port to latest (3.1) kernel
- *
- *  This program is free software; you can redistribute  it and/or modify it
- *  under  the terms of  the GNU General  Public License as published by the
- *  Free Software Foundation; version 2 ONLY.
+ * This program is free software; you can redistribute  it and/or modify it
+ * under  the terms of  the GNU General  Public License as published by the
+ * Free Software Foundation; version 2 ONLY.
  * 
  */
 
@@ -32,6 +29,7 @@
 #include <asm/mach/map.h>
 #include <asm/sizes.h>
 
+#include <mach/pxa3xx-regs.h>
 #include <mach/pxa300.h>
 #include <mach/audio.h>
 #include <mach/pxafb.h>
@@ -45,7 +43,6 @@
 
 #include <linux/gpio_keys.h>
 #include <linux/usb/gpio_vbus.h>
-//#include <linux/i2c.h>
 #include <linux/i2c/pxa-i2c.h>
 #include <linux/regulator/machine.h>
 #include <linux/regulator/max8660.h>
@@ -57,42 +54,37 @@
 #include "generic.h"
 
 /*
- * Machine specs:
+ * Machine specs in general:
  * 
- * PXA303 processor
- * XGA chimei_tentative TFT LCD (requires PCDDIV to be set!)
- * MAX8660 power management IC on PWR-I2C
+ * PXA303 processor, 256MB DDR2 DRAM
+ * XGA "chimei_tentative" (??) TFT reflective LCD (requires PCDDIV to be set!)
+ * 	768x1024, 64-level grayscale
+ * MAX8660 power management IC on PWR_I2C
  * 
- * Wacom touchscreen on FFUART, with GPIO lines
+ * Wacom touchscreen (ISDV4) on FFUART, with GPIO lines (Pen detect & Sleep)
  * 
- * BTUART is debug port
+ * BTUART is a debug port
  * 
- * RT5611 AC97 audio codec
+ * ALC5611 AC97 audio codec
  * 
  * BQ27541 gauge on I2C (inside battery pack)
  * BQ24072 charger with GPIO signals
- * 	GPIO79 - charging 
+ * 	GPIO79 - charging
  * 	GPIO0_2 - power_good (detect VBUS)
  * 
- * CIF camera
+ * OV2655 - 2MP camera - sits on Quick Capture If.
  * 
- * WIFI on MMC2 SDIO (so, only SPI mode) with GPIO reset
+ * MMC1 controller: inner microSD + external microSD
+ * MMC2 controller: SDIO WIFI (Marvell SD8686) with reset & WOL lines on GPIO
  * 
- * MMC1 inner microSD + external microSD
- * MMC2 - WIFI
+ * "Power" key sits on GPIO (pin 127)
  * 
- * GPIO key "Suspend"
- * LDS6128 sensor keypad on I2C, with IRQ on pin 76
- * Suspend LED controlled by LDS6128
- */ 
-
-/*
- * MFP configs
+ * LDS6128 capacitive sensor keypad on I2C, with IRQ on pin 76
+ * "Power" LED is controlled by LDS6128
  */
 
-/* 
- * LCD
- */
+/* MFP configs */
+/* LCD */
 static mfp_cfg_t lcd_mfp_cfg[] __initdata = {
 	/* Data */
 	GPIO54_LCD_LDD_0,
@@ -112,22 +104,15 @@ static mfp_cfg_t lcd_mfp_cfg[] __initdata = {
 	GPIO68_LCD_LDD_14,
 	GPIO69_LCD_LDD_15,
 	GPIO70_LCD_LDD_16,
-	GPIO71_GPIO,				// ??
 	
 	/* Clocks */
 	GPIO72_LCD_FCLK,
 	GPIO73_LCD_LCLK,
 	MFP_CFG_DRV(GPIO74, AF1, DS04X),	//PCLK high current
 	GPIO75_LCD_BIAS,
-	GPIO76_GPIO,
-	
-	GPIO83_GPIO | MFP_LPM_DRIVE_LOW,	//Blank
-	MFP_CFG_DRV(GPIO77, AF0, DS13X)		//Backlight
 };
 	
-/*
- * UARTs
- */
+/* UARTs */
 static mfp_cfg_t uart_mfp_cfg[] __initdata = {
 	/* FFUART */
 	GPIO30_UART1_RXD,
@@ -144,20 +129,13 @@ static mfp_cfg_t uart_mfp_cfg[] __initdata = {
 	GPIO112_UART2_RXD | MFP_LPM_EDGE_BOTH,
 	GPIO113_UART2_TXD,
 	GPIO114_UART2_CTS,
-	
-	/* STUART */
-	GPIO109_UART3_TXD,
-	GPIO110_UART3_RXD,
 };
 
-/*
- * AC97 - ALC5611 codec
- */
+/* AC97 - ALC5611 codec */
 static mfp_cfg_t ac97_mfp_cfg[] __initdata = {
 	GPIO23_AC97_nACRESET 	| MFP_LPM_PULL_LOW,
 	
 	GPIO24_AC97_SYSCLK,
-	//GPIO24_GPIO 		| MFP_LPM_PULL_LOW,
 	GPIO25_AC97_SDATA_IN_0,
 	GPIO27_AC97_SDATA_OUT,
 	GPIO28_AC97_SYNC,
@@ -168,9 +146,7 @@ static mfp_cfg_t ac97_mfp_cfg[] __initdata = {
 	GPIO1_2_GPIO,
 };
 
-/*
- * CIF Camera
- */
+/* CIF Camera */
 static mfp_cfg_t cif_mfp_cfg[] __initdata = {
 	/* QCI proto */
 	GPIO39_CI_DD_0,
@@ -189,26 +165,7 @@ static mfp_cfg_t cif_mfp_cfg[] __initdata = {
 	GPIO52_CI_VSYNC
 };
 
-/*
- * Generic MFP
- */
-static mfp_cfg_t generic_mfp_cfg[] __initdata = {
-	GPIO76_GPIO,			//LDS IRQ pin
-	GPIO127_GPIO |\
-		MFP_LPM_EDGE_FALL | MFP_LPM_PULL_HIGH, //Suspend button
-	GPIO106_USB_P2_7, 		//OTG ID pin
-	GPIO86_GPIO,			//WLAN reset
-	GPIO79_GPIO,			//Charger "charging" pin
-	GPIO0_2_GPIO |\
-		MFP_LPM_EDGE_BOTH | MFP_LPM_FLOAT, //Charger "power ok" pin
-	/* Standard I2C */
-	GPIO21_I2C_SCL,
-	GPIO22_I2C_SDA,
-};
-
-/*
- * MMC generic
- */
+/* MMC generic */
 static mfp_cfg_t mmc_mfp_cfg[] __initdata = {
 	/* MMC1 */
 	GPIO53_GPIO,		//External mSD card detect
@@ -217,7 +174,7 @@ static mfp_cfg_t mmc_mfp_cfg[] __initdata = {
 	GPIO5_MMC1_DAT2,
 	GPIO6_MMC1_DAT3,
 	GPIO7_MMC1_CLK,
-	
+
 	/* MMC2 */
 	GPIO9_MMC2_DAT0,
 	GPIO10_MMC2_DAT1,
@@ -227,15 +184,27 @@ static mfp_cfg_t mmc_mfp_cfg[] __initdata = {
 	GPIO14_MMC2_CMD,
 };
 
-/*
- * Framebuffer
- */
-#if defined(CONFIG_FB_PXA) || defined(CONFIG_FB_PXA_MODULE)
+/* Generic MFP */
+static mfp_cfg_t generic_mfp_cfg[] __initdata = {
+	GPIO76_GPIO,			//LDS IRQ
+	MFP_CFG_DRV(GPIO77, AF0, DS13X),//LCD Backlight (??)
+	GPIO79_GPIO,			//Charger "charging"
+	GPIO81_GPIO,			//Wacom PDCT
+	GPIO82_GPIO,			//Wacom sleep
+	GPIO83_GPIO | MFP_LPM_DRIVE_LOW,//LCD Blank
+	GPIO86_GPIO,			//WLAN reset
+	GPIO106_USB_P2_7, 		//OTG ID pin
+	GPIO119_GPIO,			//I2C bridge control
+	GPIO127_GPIO | MFP_LPM_EDGE_FALL | MFP_LPM_PULL_HIGH, //Suspend button
+	GPIO0_2_GPIO | MFP_LPM_EDGE_BOTH | MFP_LPM_FLOAT, //Charger "powergood"
+	/* Standard I2C */
+	GPIO21_I2C_SCL,
+	GPIO22_I2C_SDA,
+};
+
+/* Framebuffer */
 static void zetablet_lcd_power(int on, struct fb_var_screeninfo *screen)
 {
-	/* MFP for MFP_BACKLIGHT_PWM is supposed to be configured */
-	gpio_request(ETABLET_GPIO_LCD_BACKLIGHT	, "LCD Backlight");
-	gpio_request(ETABLET_GPIO_LCD_BLANK	, "LCD Blank");
 	if(on){
 		gpio_direction_output(ETABLET_GPIO_LCD_BACKLIGHT, 1);
 		mdelay(5);
@@ -261,6 +230,7 @@ static struct pxafb_mode_info chimei_tentative_mode = {
 	.upper_margin	= 4,
 	.lower_margin	= 4,
 	.sync		= 0,
+	.cmap_greyscale = 1,
 };
 
 static struct pxafb_mach_info chimei_tentative_info = {
@@ -274,25 +244,24 @@ static struct pxafb_mach_info chimei_tentative_info = {
 	.pxafb_backlight_power	= NULL,
 	.pxafb_lcd_power	= zetablet_lcd_power,
 	
-	.modes			= &chimei_tentative_mode
+	.modes			= &chimei_tentative_mode,
+	.video_mem_size		= 768*1024*2 * 2,
 };
 
 static void __init zetablet_init_lcd(void)
 {
 	pxa3xx_mfp_config(ARRAY_AND_SIZE(lcd_mfp_cfg));
+	gpio_request(ETABLET_GPIO_LCD_BACKLIGHT	, "LCD Backlight");
+	gpio_request(ETABLET_GPIO_LCD_BLANK	, "LCD Blank");
+	gpio_direction_output(ETABLET_GPIO_LCD_BACKLIGHT, 1);
+	gpio_direction_output(ETABLET_GPIO_LCD_BLANK, 1);
 	/*
 	 * Just use our chimey XGA LCD without any checks
 	 */
 	pxa_set_fb_info(NULL, &chimei_tentative_info);
 }
-#else
-static inline void zetablet_init_lcd(void) {}
-#endif
 
-
-/*
- * MMC stuff
- */
+/* MMC slot selection MFP configs */
 static mfp_cfg_t mmc_sel_0_mfp_cfg[] = {
 	GPIO8_GPIO | MFP_LPM_PULL_HIGH,
 	GPIO15_MMC1_CMD,
@@ -308,7 +277,6 @@ static mfp_cfg_t mmc_sel_nothing_mfp_cfg[] = {
 	GPIO15_GPIO | MFP_LPM_PULL_HIGH,
 };
 
-#if defined(CONFIG_MMC)
 static int zetablet_mci_multi_select_slot(struct device* dev, unsigned int id)
 {
 	if (id==1) {
@@ -414,7 +382,7 @@ static void __init zetablet_init_mmc(void)
 	gpio_free(ETABLET_GPIO_WLAN_RESET);
 	
 	/* Create alias of first MCI controller's clock for 'multi' driver */
-	mci_clk = clk_get_sys("pxa2xx-mci.0", NULL);  
+	mci_clk = clk_get_sys("pxa2xx-mci.0", NULL);
         alias_clk_lu = clkdev_alloc(mci_clk, NULL, "pxamci-multi.0");
         clk_put(mci_clk);
         clkdev_add(alias_clk_lu);
@@ -423,25 +391,8 @@ static void __init zetablet_init_mmc(void)
 	platform_device_register(&zetablet_device_pxamci_multi);
 	pxa3xx_set_mci2_info(&zetablet_mci2_pdata);
 }
-#else
-static inline void __init zetablet_init_mmc(void)
-{
-	/* Put wifi to sleep, we can't use it without MMC */
-	gpio_request(ETABLET_GPIO_WLAN_RESET, "WLAN Reset");
-	gpio_direction_output(ETABLET_GPIO_WLAN_RESET, 0);
-	
-	/* Deselect slots */
-	pxa3xx_mfp_config(ARRAY_AND_SIZE(mmc_sel_nothing_mfp_cfg));
-	gpio_request(ETABLET_GPIO_MMC1_SLOT0_CMD, "MMC Slot 0 CMD");
-	gpio_request(ETABLET_GPIO_MMC1_SLOT1_CMD, "MMC Slot 1 CMD");
-	gpio_direction_output(ETABLET_GPIO_MMC1_SLOT1_CMD, 1);
-	gpio_direction_output(ETABLET_GPIO_MMC1_SLOT0_CMD, 1);
-}
-#endif
 
-/*
- * GPIO buttons
- */
+/* GPIO buttons */
 static struct gpio_keys_button zetablet_gpio_keys_buttons[] = {
 	{
 	  .code = KEY_SUSPEND,
@@ -465,25 +416,14 @@ static struct platform_device zetablet_device_gpio_keys = {
 	.id   = -1,
 };
 
-/*
- * OHCI
- */
+/* OHCI */
 static struct pxaohci_platform_data zetablet_ohci_pdata = {
 	.port_mode	= PMM_PERPORT_MODE,
 	.flags		= ENABLE_PORT1 | ENABLE_PORT2 |
 			  POWER_CONTROL_LOW | POWER_SENSE_LOW,
 };
 
-
-static void __init zetablet_init_ohci(void)
-{
-	pxa_set_ohci_info(&zetablet_ohci_pdata);
-}
-
-
-/*
- * USB Device Controller
- */
+/* USB Device Controller (UDC) */
 static struct gpio_vbus_mach_info zetablet_gpiovbus_pdata = {
 	.gpio_vbus = ETABLET_GPIO_CHRG_PG,
 	.gpio_pullup = -1,
@@ -559,106 +499,130 @@ static void __init zetablet_init_udc(void)
 
 /*
  * MAX8660 PMIC support
+ * First of all, these are needed to provide VCC_CORE & VCC_APPS regulators
+ * to DVM device, thus giving us nice voltage scaling and long battery life
  */
-static struct regulator_consumer_supply max8660_v6_consumers[] = {
-	{
-		.supply = "V6",
-	}
+
+static struct regulator_consumer_supply reg_vcore_supplies[] = {
+	REGULATOR_SUPPLY("VCC_CORE", "pxa3xx-dvm"),
 };
 
-static struct regulator_init_data max8660_v6_info = {
+static struct regulator_consumer_supply reg_vsram_supplies[] = {
+	REGULATOR_SUPPLY("VCC_SRAM", "pxa3xx-dvm"),
+};
+
+static struct regulator_init_data reg_vcore_info = {
 	.constraints = {
-		.name = "V6",
-		.min_uV = 1800000,
-		.max_uV = 3300000,
+		.name = "vcc_core",
+		.min_uV = 900000,
+		.max_uV = 1500000,
 		.boot_on = 1,
-		.valid_ops_mask = REGULATOR_CHANGE_VOLTAGE,
+		.valid_ops_mask = REGULATOR_CHANGE_VOLTAGE |
+				  REGULATOR_CHANGE_STATUS ,
 	},
-	.num_consumer_supplies = ARRAY_SIZE(max8660_v6_consumers),
-	.consumer_supplies = max8660_v6_consumers,
+	.num_consumer_supplies = ARRAY_SIZE(reg_vcore_supplies),
+	.consumer_supplies = reg_vcore_supplies,
+};
+
+static struct regulator_init_data reg_vsram_info = {
+	.constraints = {
+		.name = "vcc_sram",
+		.min_uV = 900000,
+		.max_uV = 1500000,
+		.boot_on = 1,
+		.valid_ops_mask = REGULATOR_CHANGE_VOLTAGE |
+				  REGULATOR_CHANGE_STATUS ,
+	},
+	.num_consumer_supplies = ARRAY_SIZE(reg_vsram_supplies),
+	.consumer_supplies = reg_vsram_supplies,
 };
 
 static struct max8660_subdev_data max8660_subdevs[] = {
 	{ 
-		.name = "V6", 
-		.id = MAX8660_V6,
-		.platform_data = &max8660_v6_info
+		.name = "vcc_core",
+		.id = MAX8660_V3,
+		.platform_data = &reg_vcore_info
+	},{
+		.name = "vcc_sram",
+		.id = MAX8660_V4,
+		.platform_data = &reg_vsram_info
 	},
 };
 
 static struct max8660_platform_data max8660_pdata = {
+	/* NOTE: V3/V4 are physically disabled only when EN34 is low
+	 * 	AND they are "disabled" in software (via I2C).
+	 * So, we must be able to virtually enable/disable them in software,
+	 * despite the fact that our setting would take effect only in
+	 * "sleep" (or "deep sleep" S3/D4/C4) power mode
+	 * Therefore, en34_is_high = 0
+	 */
+	
 	.subdevs = max8660_subdevs,
 	.num_subdevs = ARRAY_SIZE(max8660_subdevs),
 	.en34_is_high = 0,
 };
 
-/*
- * PWR I2C devices
- */
-static struct i2c_pxa_platform_data zetablet_pwri2c_pdata = {
-	.fast_mode = 1,
-};
-
-static struct i2c_board_info zetablet_pwri2c_devices[] = {
-	{
-		I2C_BOARD_INFO("max8660", 0x34),
-		.platform_data = &max8660_pdata,
-	},
-};
-
-/*
- * LDS6128 sensor keypad
- */
+/* LDS6128 sensor keypad */
 static struct lds61xx_channel lds61xx_channels[] = {
 	{
+		/* "Return" key */
 		.id = 0,
 		.type = LDS_CHANNEL_TOUCH,
 		.enabled = 1,
 		.init_threshold = 18,
 	},
 	{
+		/* "F1" key */
 		.id = 1,
 		.type = LDS_CHANNEL_TOUCH,
 		.enabled = 1,
 		.init_threshold = 23,
 	},
 	{
+		/* "F2" key */
 		.id = 2,
 		.type = LDS_CHANNEL_TOUCH,
 		.enabled = 1,
 		.init_threshold = 17,
 	},
 	{
+		/* "F3" key */
 		.id = 3,
 		.type = LDS_CHANNEL_TOUCH,
 		.enabled = 1,
 		.init_threshold = 16,
 	},
 	{
+		/* "F4" key */
 		.id = 4,
 		.type = LDS_CHANNEL_TOUCH,
 		.enabled = 1,
 		.init_threshold = 19,
 	},
 	{
+		/* "Left" key */
 		.id = 5,
 		.type = LDS_CHANNEL_TOUCH,
 		.enabled = 1,
 		.init_threshold = 26,
 	},
 	{
+		/* "Home" key */
 		.id = 10,
 		.type = LDS_CHANNEL_TOUCH,
 		.enabled = 1,
 		.init_threshold = 34,
 	},
 	{
+		/* "Right" key */
 		.id = 13,
 		.type = LDS_CHANNEL_TOUCH,
 		.enabled = 1,
 		.init_threshold = 26,
 	},
 	{
+		/* LED underneath power button */
 		.id = 15,
 		.type = LDS_CHANNEL_LED,
 		.enabled = 1,
@@ -688,17 +652,34 @@ static struct lds61xx_pdata lds61xx_pdata = {
 	.init_ambient_neg_limit = 17,
 };
 
+/* BQ27500 platform data (just canonical batt. name) */
+static struct bq27000_platform_data bq27500_pdata = {
+	.name = "BAT0",
+};
 
-/*
- * I2C devices
- */
+/* Std. I2C */
 static struct i2c_pxa_platform_data zetablet_i2c_pdata = {
-	.fast_mode = 1,
+	.fast_mode = 0,
+	.use_pio = 0,
+};
+
+/* PWR_I2C */
+static struct i2c_pxa_platform_data zetablet_pwri2c_pdata = {
+	.fast_mode = 0,
+	.use_pio = 0,
+};
+
+static struct i2c_board_info zetablet_pwri2c_devices[] = {
+	{
+		I2C_BOARD_INFO("max8660", 0x34),
+		.platform_data = &max8660_pdata,
+	},
 };
 
 static struct i2c_board_info zetablet_i2c_devices[] = {
 	{
 		I2C_BOARD_INFO("bq27500", 0x55),
+		.platform_data = &bq27500_pdata,
 	},
 	{
 		I2C_BOARD_INFO("lds61xx", 0x2C),
@@ -706,16 +687,44 @@ static struct i2c_board_info zetablet_i2c_devices[] = {
 	},
 };
 
-/*
- * USB Charger stuff  (via gpio-charger)
- */
-static char* zetablet_gpiochrg_batt = "bq27500-0";
+static void __init zetablet_init_i2c(void)
+{
+	/* Configure Std. I2C & PWR_I2C buses
+	 * and register some devices connected to them:
+	 * Std. I2C:
+	 * 	-Battery gauge (BQ27541)
+	 * 	-Capacitive keypad (LDS6128)
+	 * PWR_I2C:
+	 * 	-PMIC (MAX8660)
+	 *
+	 * Also, there is uncommon thing: these buses are physically bridged
+	 * 	with PCA9515 bus repeater. Probably, this is done in order
+	 * 	to be able to "speak" with PMIC via Std. I2C bus, thus
+	 * 	avoiding need for software PWR_I2C driver.
+	 * However, we does register PWR_I2C as i2c bus to the kernel and we
+	 *	will drive PMIC via that bus. So, PCA9515 must be completely
+	 *	disabled by driving GPIO 119 (Enable pin) low. */
+
+	gpio_request(ETABLET_GPIO_I2C_BRIDGE, "PCA9515 enable");
+	gpio_direction_output(ETABLET_GPIO_I2C_BRIDGE, 0);
+
+	pxa_set_i2c_info(&zetablet_i2c_pdata);
+	pxa3xx_set_i2c_power_info(&zetablet_pwri2c_pdata);
+
+	i2c_register_board_info(0, ARRAY_AND_SIZE(zetablet_i2c_devices));
+	i2c_register_board_info(1, ARRAY_AND_SIZE(zetablet_pwri2c_devices));
+}
+
+/* BQ24072 USB charger (via gpio-charger) */
+static char* zetablet_gpiochrg_consumers[] = {
+	"BAT0",
+};
 
 static struct gpio_charger_platform_data zetablet_gpiochrg_pdata = {
-	.name = "usb_charger",
+	.name = "USB",
 	.type = POWER_SUPPLY_TYPE_USB,
 	.gpio = ETABLET_GPIO_CHRG_CHRG,
-	.supplied_to = &zetablet_gpiochrg_batt,
+	.supplied_to = zetablet_gpiochrg_consumers,
 	.num_supplicants = 1,
 };
 
@@ -727,22 +736,23 @@ static struct platform_device zetablet_device_charger = {
 	},
 };
 
-/*
- * RT5611 (WM9713) stuff
- */
+/* Audio board */
 static struct platform_device zetablet_device_audio = {
 	.name		= "etablet-audio",
 	.id		= -1,
 };
 
-/*
- * Syscore ops for suspend/resume hacking
- */
+/* Software dynamic voltage management */
+static struct platform_device zetablet_device_dvm = {
+	.name		= "pxa3xx-dvm",
+	.id		= -1,
+};
+
+/* Syscore ops for suspend/resume hacking */
 static int zetablet_sys_suspend(void)
 {
 	/* Enable wakeups here */
-	printk(KERN_INFO "ETABLET suspending\n");
-	enable_irq_wake(IRQ_MMC3);
+	pr_info("ETABLET suspending\n");
 	enable_irq_wake(IRQ_BTUART);
 	return 0;
 }
@@ -751,8 +761,7 @@ static int zetablet_sys_suspend(void)
 static void zetablet_sys_resume(void)
 {
 	/* Disable wakeups */
-	printk(KERN_INFO "ETABLET resuming\n");
-	disable_irq_wake(IRQ_MMC3);
+	pr_info("ETABLET resuming\n");
 	disable_irq_wake(IRQ_BTUART);
 }
 
@@ -763,14 +772,13 @@ static struct syscore_ops zetablet_syscore_ops = {
 
 /*
  * Power-off proc
- * We use S3D4C4 as the power-down mode
+ * Just go to S3D4C4
  */
 static void zetablet_power_off(void)
 {
-	unsigned int pwrmode;
-	pwrmode = PXA3xx_PM_S3D4C4;
+	unsigned int pwrmode = PXA3xx_PM_S3D4C4;
 	
-	printk(KERN_INFO "ETABLET going to S3D4C4\n");
+	pr_info("ETABLET going to S3D4C4\n");
 	asm volatile("mcr	p14, 0, %[state], c7, c0, 0"
 			:: [state]"r" (pwrmode));
 }
@@ -780,46 +788,26 @@ static void zetablet_power_off(void)
  */
 static void __init zetablet_init(void)
 {
-	struct clk *clk_pout, *clk_ac97;
-	/* Generic MFP configuration */
+	/* Disable hardware voltage sequencer (we have DVM!) */
+	PVCR = 0x34;
+	
+	/* MFP configuration */
 	pxa3xx_mfp_config(ARRAY_AND_SIZE(generic_mfp_cfg));
-	
-	/* UARTs init */
 	pxa3xx_mfp_config(ARRAY_AND_SIZE(uart_mfp_cfg));
-	pxa_set_ffuart_info(NULL);
-	pxa_set_btuart_info(NULL);
-	pxa_set_stuart_info(NULL);
-	
-	/* Charger */
-	//platform_device_register(&zetablet_gpiochrg);
-	
-	/* I2C */
-	pxa_set_i2c_info(&zetablet_i2c_pdata);
-	pxa3xx_set_i2c_power_info(&zetablet_pwri2c_pdata);
-	
-	i2c_register_board_info(0, ARRAY_AND_SIZE(zetablet_i2c_devices));
-	i2c_register_board_info(1, ARRAY_AND_SIZE(zetablet_pwri2c_devices));
-	
-	/* Camera */
 	pxa3xx_mfp_config(ARRAY_AND_SIZE(cif_mfp_cfg));
-	
-	/* AC97 */
 	pxa3xx_mfp_config(ARRAY_AND_SIZE(ac97_mfp_cfg));
 	
-	/* Enable CLK_POUT */
+	/* UARTs init */
+	pxa_set_ffuart_info(NULL);
+	pxa_set_btuart_info(NULL);
 	
-	//clk_pout = clk_get_sys(NULL, "CLK_POUT");
-	//if(IS_ERR(clk_pout)){
-	//	printk(KERN_ERR "CLK_POUT unavailable\n");
-	//}
-	//clk_enable(clk_pout);
+	/* Charger */
+	platform_device_register(&zetablet_device_charger);
 	
-	//clk_ac97 = clk_get_sys(NULL, "AC97CLK");
-	//if(IS_ERR(clk_ac97)){
-	//	printk(KERN_ERR "CLK_AC97 unavailable\n");
-	//}
-	//clk_enable(clk_ac97);
+	/* I2C */
+	zetablet_init_i2c();
 	
+	/* AC97 */
 	pxa_set_ac97_info(NULL);
 	platform_device_register(&zetablet_device_audio);
 	
@@ -827,15 +815,22 @@ static void __init zetablet_init(void)
 	platform_device_register(&zetablet_device_gpio_keys);
 	zetablet_init_lcd();
 	zetablet_init_mmc();
-	//zetablet_init_ohci();
+	//pxa_set_ohci_info(&zetablet_ohci_pdata);
 	zetablet_init_udc();
+	platform_device_register(&pxa3xx_device_gcu);
 	
 	/* Power management */
+	platform_device_register(&zetablet_device_dvm);
 	register_syscore_ops(&zetablet_syscore_ops);
 	pm_power_off = zetablet_power_off;
+
+	/* Wacom tests */
+	gpio_request(ETABLET_GPIO_WACOM_PDCT, "Wacom pen");
+	gpio_direction_input(ETABLET_GPIO_WACOM_PDCT);
 }
+
 /*
- * Custom IO mapping
+ * Custom MMIO mapping
  * Override default pxa3xx_map_io, because it doesn't map DDR controller MMIO
  * We need that for suspend/standby modes
  * BUG?
