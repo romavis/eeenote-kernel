@@ -529,7 +529,26 @@ static int ac97_write_mask(struct snd_soc_codec *codec,unsigned int reg,unsigned
 	return ac97_write(codec,reg,CodecData);
 }
 
-
+/*
+ * RT5611 PLL is organized in the following way:
+ *
+ *                                                               Fvco
+ *        ________________     ________       ________     _____   |   ________
+ *       |                |   |        |     |        |   |     |  V  |        |
+ * MCLK->|pre_div ? /2 : 1|-+>| /(M+2) |--+->|Detector|-->| VCO |---->| /(K+2) |
+ *       |________________| | |________|  |  |________    |_____|     |________|
+ *                          |  _________  |      |           |             |
+ *                          | |         | |      |        ___v____         |
+ *                          +>|omit Mdiv|>+      |       |        |        V
+ *                            |_________|        +<------| /(N+2) |      Output
+ *                                                       |________|
+ *
+ * We want Output == 24.576 MHz, K is typically 2, so we should target
+ * 	Fvco == 98.304M
+ * Datasheet says that MCLK must be between 2.048M and 80M, so we would never
+ * 	omit M divider (the lower comparison frequency is, the greater is
+ * 	tolerance).
+ */
 /* PLL divisors */
 struct _pll_div {
 	u32 pll_in;
@@ -578,7 +597,7 @@ static int rt5611_set_pll(struct snd_soc_codec *codec,
 	return 0;	
 }	
 
-static int rt5611_set_dai_pll(struct snd_soc_dai *codec_dai, int pll_id,
+static int rt5611_dai_set_pll_hifi(struct snd_soc_dai *codec_dai, int pll_id,
 		int source, unsigned int freq_in, unsigned int freq_out)
 {
 	struct snd_soc_codec *codec = codec_dai->codec;
@@ -587,7 +606,7 @@ static int rt5611_set_dai_pll(struct snd_soc_dai *codec_dai, int pll_id,
 	return 0;
 }
 
-static int ac97_hifi_prepare(struct snd_pcm_substream *substream,
+static int rt5611_dai_prepare_hifi(struct snd_pcm_substream *substream,
 			     struct snd_soc_dai *dai)
 {
 	struct snd_soc_codec *codec = dai->codec;
@@ -609,36 +628,38 @@ static int ac97_hifi_prepare(struct snd_pcm_substream *substream,
 
 #define RT5611_RATES (SNDRV_PCM_RATE_8000 |\
 		      SNDRV_PCM_RATE_11025 |\
+		      SNDRV_PCM_RATE_16000 |\
 		      SNDRV_PCM_RATE_22050 |\
+		      SNDRV_PCM_RATE_32000 |\
 		      SNDRV_PCM_RATE_44100 |\
 		      SNDRV_PCM_RATE_48000)
 
 #define RT5611_PCM_FORMATS SNDRV_PCM_FMTBIT_S16_LE
 
 static const struct snd_soc_dai_ops rt5611_dai_ops_hifi = {
-	.prepare = ac97_hifi_prepare,
-	.set_pll = rt5611_set_dai_pll,
+	.prepare = rt5611_dai_prepare_hifi,
+	.set_pll = rt5611_dai_set_pll_hifi,
 };
 
 static struct snd_soc_dai_driver rt5611_dai[] = {
 	{
-	.name = "rt5611-hifi",
-	.ac97_control = 1,
-	.playback = {
-		.stream_name = "Playback",
-		.channels_min = 1,
-		.channels_max = 2,
-		.rates = RT5611_RATES,
-		.formats = RT5611_PCM_FORMATS,
-	},
-	.capture = {
-		.stream_name = "Capture",
-		.channels_min = 1,
-		.channels_max = 2,
-		.rates = RT5611_RATES,
-		.formats = RT5611_PCM_FORMATS,
-	},
-	.ops = &rt5611_dai_ops_hifi,
+		.name = "rt5611-hifi",
+		.ac97_control = 1,
+		.playback = {
+			.stream_name = "Playback",
+			.channels_min = 1,
+			.channels_max = 2,
+			.rates = RT5611_RATES,
+			.formats = RT5611_PCM_FORMATS,
+		},
+		.capture = {
+			.stream_name = "Capture",
+			.channels_min = 1,
+			.channels_max = 2,
+			.rates = RT5611_RATES,
+			.formats = RT5611_PCM_FORMATS,
+		},
+		.ops = &rt5611_dai_ops_hifi,
 	},
 };
 
@@ -657,7 +678,7 @@ int rt5611_reset(struct snd_soc_codec *codec, int try_warm)
 		return -EIO;
 	return 0;
 }
-EXPORT_SYMBOL_GPL(rt5611_reset);
+//EXPORT_SYMBOL_GPL(rt5611_reset);
 
 static int rt5611_set_bias_level(struct snd_soc_codec *codec,
 				 enum snd_soc_bias_level level)
@@ -673,14 +694,19 @@ static int rt5611_set_bias_level(struct snd_soc_codec *codec,
 	switch (level) {
 	case SND_SOC_BIAS_ON:
 		/* enable thermal shutdown */
-		ac97_write_mask(codec, RT5611_PWR_MANAG_ADD2, EN_THREMAL_SHUTDOWN, EN_THREMAL_SHUTDOWN);
+		ac97_write_mask(codec, RT5611_PWR_MANAG_ADD2,
+				EN_THREMAL_SHUTDOWN, EN_THREMAL_SHUTDOWN);
 		break;
 	case SND_SOC_BIAS_PREPARE:
 		break;
 	case SND_SOC_BIAS_STANDBY:
 		/* enable master bias and vmid */
-		ac97_write_mask(codec, RT5611_PWR_MANAG_ADD1, PWR_MAIN_BIAS | PWR_DAC_REF, PWR_MAIN_BIAS | PWR_DAC_REF);
-		ac97_write_mask(codec, RT5611_PWR_MANAG_ADD2, PWR_MIXER_VREF, PWR_MIXER_VREF);
+		ac97_write_mask(codec, RT5611_PWR_MANAG_ADD1,
+				PWR_MAIN_BIAS | PWR_DAC_REF,
+				PWR_MAIN_BIAS | PWR_DAC_REF);
+		ac97_write_mask(codec, RT5611_PWR_MANAG_ADD2,
+				PWR_MIXER_VREF,
+				PWR_MIXER_VREF);
 		ac97_write(codec, RT5611_PD_CTRL_STAT, 0x0000);
 		break;
 	case SND_SOC_BIAS_OFF:
