@@ -46,6 +46,7 @@
 #define LCCR4_PAL_FOR_2	(2 << 15)
 #define LCCR4_PAL_FOR_3	(3 << 15)
 #define LCCR4_PAL_FOR_MASK	(3 << 15)
+#define LCCR4_PCDDIV    (1<<31) /* PCD Divisor Selection */ 
 
 #define FDADR0		(0x200)	/* DMA Channel 0 Frame Descriptor Address Register */
 #define FDADR1		(0x210)	/* DMA Channel 1 Frame Descriptor Address Register */

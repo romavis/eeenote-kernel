@@ -1021,7 +1021,12 @@ static inline unsigned int get_pcd(struct pxafb_info *fbi,
 	 * speeds */
 	pcd = (unsigned long long)(clk_get_rate(fbi->clk) / 10000);
 	pcd *= pixclock;
-	do_div(pcd, 100000000 * 2);
+	
+	if(fbi->lccr4 & LCCR4_PCDDIV)
+	  do_div(pcd, 100000000);
+	else
+	  do_div(pcd, 100000000 * 2);
+	
 	/* no need for this, since we should subtract 1 anyway. they cancel */
 	/* pcd += 1; */ /* make up for integer math truncations */
 	return (unsigned int)pcd;
@@ -1433,7 +1438,8 @@ static void pxafb_enable_controller(struct pxafb_info *fbi)
 	pr_debug("reg_lccr1 0x%08x\n", (unsigned int) fbi->reg_lccr1);
 	pr_debug("reg_lccr2 0x%08x\n", (unsigned int) fbi->reg_lccr2);
 	pr_debug("reg_lccr3 0x%08x\n", (unsigned int) fbi->reg_lccr3);
-
+	pr_debug("reg_lccr4 0x%08x\n", (unsigned int) fbi->reg_lccr4);
+	
 	/* enable LCD controller clock */
 	clk_prepare_enable(fbi->clk);
 
