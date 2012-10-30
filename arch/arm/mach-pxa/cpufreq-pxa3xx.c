@@ -16,8 +16,14 @@
 #include <linux/cpufreq.h>
 #include <linux/slab.h>
 #include <linux/io.h>
+#include <linux/platform_device.h>
+#include <linux/regulator/consumer.h>
+#include <linux/semaphore.h>
+
+#include <asm-generic/errno.h>
 
 #include <mach/pxa3xx-regs.h>
+#include <mach/pxa3xx-dvm.h>
 
 #include "generic.h"
 
@@ -71,24 +77,121 @@ struct pxa3xx_freq_info {
 
 static struct pxa3xx_freq_info pxa300_freqs[] = {
 	/*  CPU XL XN  HSS DMEM SMEM SRAM DFI VCC_CORE VCC_SRAM */
-	OP(104,  8, 1, 104, 260,  78, 104, 3, 1000, 1100), /* 104MHz */
-	OP(208, 16, 1, 104, 260, 104, 156, 2, 1000, 1100), /* 208MHz */
-	OP(416, 16, 2, 156, 260, 104, 208, 2, 1100, 1200), /* 416MHz */
-	OP(624, 24, 2, 208, 260, 208, 312, 3, 1375, 1400), /* 624MHz */
+	OP(104,  8, 1, 104, 260,  78, 104, 3, 1100, 1100), /* 104MHz */
+	OP(208, 16, 1, 104, 260, 104, 156, 2, 1100, 1100), /* 208MHz */
+	OP(416, 16, 2, 156, 260, 104, 208, 2, 1100, 1100), /* 416MHz */
+	OP(624, 24, 2, 208, 260, 208, 312, 3, 1375, 1375), /* 624MHz */
 };
 
 static struct pxa3xx_freq_info pxa320_freqs[] = {
 	/*  CPU XL XN  HSS DMEM SMEM SRAM DFI VCC_CORE VCC_SRAM */
-	OP(104,  8, 1, 104, 260,  78, 104, 3, 1000, 1100), /* 104MHz */
-	OP(208, 16, 1, 104, 260, 104, 156, 2, 1000, 1100), /* 208MHz */
-	OP(416, 16, 2, 156, 260, 104, 208, 2, 1100, 1200), /* 416MHz */
-	OP(624, 24, 2, 208, 260, 208, 312, 3, 1375, 1400), /* 624MHz */
+	OP(104,  8, 1, 104, 260,  78, 104, 3, 1100, 1100), /* 104MHz */
+	OP(208, 16, 1, 104, 260, 104, 156, 2, 1100, 1100), /* 208MHz */
+	OP(416, 16, 2, 156, 260, 104, 208, 2, 1100, 1100), /* 416MHz */
+	OP(624, 24, 2, 208, 260, 208, 312, 3, 1375, 1375), /* 624MHz */
 	OP(806, 31, 2, 208, 260, 208, 312, 3, 1400, 1400), /* 806MHz */
 };
 
 static unsigned int pxa3xx_freqs_num;
 static struct pxa3xx_freq_info *pxa3xx_freqs;
 static struct cpufreq_frequency_table *pxa3xx_freqs_table;
+
+/* VCC_CORE & VCC_SRAM regulators */
+static struct regulator *pxa3xx_reg_vcore;
+static struct regulator *pxa3xx_reg_vsram;
+
+/* Actual operating point set by cpufreq */
+static struct pxa3xx_freq_info *pxa3xx_actual_freq;
+
+/* Protects "frequency change" resource */
+static DEFINE_SEMAPHORE(pxa3xx_dvm_sema);
+/* Enable DVM on cpufreq transitions */
+static unsigned int pxa3xx_allow_cpufreq_dvm;
+
+/* Required voltage tolerance (in uV): +-10mV */
+#define PXA3XX_DVM_TOL		10000
+/* Voltages that are sufficient for all operating points */
+#define PXA3XX_DVM_VCORE_SUFF	1400000
+#define PXA3XX_DVM_VSRAM_SUFF	1400000
+
+static int pxa3xx_dvm_set_vcore (int volt_uV)
+{
+	int ret;
+
+	if(!pxa3xx_reg_vcore)
+		return 0;
+
+	pr_debug("DVM: VCORE req %duV", volt_uV);
+	ret = regulator_set_voltage(pxa3xx_reg_vcore,
+				    volt_uV - PXA3XX_DVM_TOL,
+				    volt_uV + PXA3XX_DVM_TOL);
+	if(ret)
+		pr_err("\nDVM: unable to set VCORE: %d (%duV)\n", ret, volt_uV);
+
+	return ret;
+}
+
+static int pxa3xx_dvm_set_vsram (int volt_uV)
+{
+	int ret;
+
+	if(!pxa3xx_reg_vsram)
+		return 0;
+
+	pr_debug("DVM: VSRAM req %duV\n", volt_uV);
+	ret = regulator_set_voltage(pxa3xx_reg_vsram,
+				    volt_uV - PXA3XX_DVM_TOL,
+				    volt_uV + PXA3XX_DVM_TOL);
+	if(ret)
+		pr_err("DVM: unable to set VSRAM: %d (%duV)\n", ret, volt_uV);
+
+	return ret;
+}
+
+static inline int _vcomp(int volt_req, int volt_curr)
+{
+	if((volt_curr > volt_req + PXA3XX_DVM_TOL) ||
+	   (volt_curr < volt_req - PXA3XX_DVM_TOL))
+		return 1;
+	return 0;
+}
+
+static int pxa3xx_cpufreq_dvm(struct pxa3xx_freq_info *freq, int stage)
+{
+	int ret = 0;
+	int vcore, vsram, req_vcore, req_vsram; /* in uV */
+	/*
+	 * Check for freq == 0, because someday supplied pxa3xx_actual_freq
+	 * might be NULL
+	 */
+	if(!pxa3xx_allow_cpufreq_dvm || !pxa3xx_reg_vcore || !freq)
+		return 0;
+
+	req_vcore = freq->vcc_core * 1000;
+	req_vsram = freq->vcc_sram * 1000;
+
+	vcore = regulator_get_voltage(pxa3xx_reg_vcore);
+	if(_vcomp(req_vcore, vcore)) {
+		if(stage == CPUFREQ_POSTCHANGE)
+			ret = pxa3xx_dvm_set_vcore(req_vcore);
+		else
+			ret = pxa3xx_dvm_set_vcore(PXA3XX_DVM_VCORE_SUFF);
+	}
+	if(ret)
+		return ret;
+
+	if(!pxa3xx_reg_vsram)
+		return 0;
+	vsram = regulator_get_voltage(pxa3xx_reg_vsram);
+	if(_vcomp(req_vsram, vsram)) {
+		if(stage == CPUFREQ_POSTCHANGE)
+			ret = pxa3xx_dvm_set_vsram(req_vsram);
+		else
+			ret = pxa3xx_dvm_set_vsram(PXA3XX_DVM_VSRAM_SUFF);
+	}
+}
+
+/* cpufreq driver */
 
 static int setup_freqs_table(struct cpufreq_policy *policy,
 			     struct pxa3xx_freq_info *freqs, int num)
@@ -170,7 +273,7 @@ static int pxa3xx_cpufreq_set(struct cpufreq_policy *policy,
 	struct pxa3xx_freq_info *next;
 	struct cpufreq_freqs freqs;
 	unsigned long flags;
-	int idx;
+	int idx, ret;
 
 	if (policy->cpu != 0)
 		return -EINVAL;
@@ -195,10 +298,22 @@ static int pxa3xx_cpufreq_set(struct cpufreq_policy *policy,
 
 	cpufreq_notify_transition(&freqs, CPUFREQ_PRECHANGE);
 
+	down(&pxa3xx_dvm_sema);
+	/* Pre-change voltage scaling */
+	if((ret = pxa3xx_cpufreq_dvm(next, CPUFREQ_PRECHANGE))) {
+		up(&pxa3xx_dvm_sema);
+		return ret;
+	}
+
 	local_irq_save(flags);
 	__update_core_freq(next);
 	__update_bus_freq(next);
 	local_irq_restore(flags);
+
+	pxa3xx_actual_freq = next;
+	/* Post-change voltage scaling */
+	pxa3xx_cpufreq_dvm(next, CPUFREQ_POSTCHANGE);
+	up(&pxa3xx_dvm_sema);
 
 	cpufreq_notify_transition(&freqs, CPUFREQ_POSTCHANGE);
 
@@ -221,12 +336,13 @@ static int pxa3xx_cpufreq_init(struct cpufreq_policy *policy)
 
 	if (cpu_is_pxa320())
 		ret = setup_freqs_table(policy, ARRAY_AND_SIZE(pxa320_freqs));
-
 	if (ret) {
 		pr_err("failed to setup frequency table\n");
 		return ret;
 	}
 
+	/* Assume that top frequency is set */
+	pxa3xx_actual_freq = &pxa3xx_freqs[pxa3xx_freqs_num - 1];
 	pr_info("CPUFREQ support for PXA3xx initialized\n");
 	return 0;
 }
@@ -239,10 +355,196 @@ static struct cpufreq_driver pxa3xx_cpufreq_driver = {
 	.name		= "pxa3xx-cpufreq",
 };
 
+/* pxa3xx-dvm platform device */
+
+static int pxa3xx_dvm_probe (struct platform_device *pdev)
+{
+	struct pxa3xx_dvm_pdata *pdata = pdev->dev.platform_data;
+	int ret;
+
+	if(pdev->id != -1) {
+		dev_err(&pdev->dev, "device id must be -1\n");
+		return -EINVAL;
+	}
+	if(!pdata) {
+		dev_err(&pdev->dev, "no platform_data\n");
+		return -EINVAL;
+	}
+
+	pxa3xx_reg_vcore = regulator_get(&pdev->dev, "VCC_CORE");
+	if(!pxa3xx_reg_vcore) {
+		dev_err(&pdev->dev, "unable to get VCC_CORE regulator\n");
+		return -ENXIO;
+	}
+
+	pxa3xx_reg_vsram = regulator_get(&pdev->dev, "VCC_SRAM");
+
+	while(pdata->pm_state_logic) {
+		if((ret = regulator_enable(pxa3xx_reg_vcore))) {
+			dev_err(&pdev->dev, "unable to enable VCC_CORE\n");
+			goto err;
+		}
+		if(!pxa3xx_reg_vsram)
+			break;
+		if((ret = regulator_enable(pxa3xx_reg_vsram))) {
+			dev_err(&pdev->dev, "unable to enable VCC_SRAM\n");
+			goto err;
+		}
+		break;
+	}
+
+	if((ret = pxa3xx_dvm_set_vcore(PXA3XX_DVM_VCORE_SUFF))) {
+		dev_err(&pdev->dev, "unable to set \"sufficient\" VCC_CORE\n");
+		goto err;
+	}
+	if((ret = pxa3xx_dvm_set_vsram(PXA3XX_DVM_VSRAM_SUFF))) {
+		dev_err(&pdev->dev, "unable to set \"sufficient\" VCC_SRAM\n");
+		goto err;
+	}
+
+	down(&pxa3xx_dvm_sema);
+	pxa3xx_allow_cpufreq_dvm = pdata->freq_transition_logic;
+	up(&pxa3xx_dvm_sema);
+
+	dev_info(&pdev->dev, "PXA3xx voltage sequencer enabled\n");
+
+	return 0;
+err:
+	regulator_put(pxa3xx_reg_vcore);
+	if(pxa3xx_reg_vsram)
+		regulator_put(pxa3xx_reg_vsram);
+	return ret;
+}
+
+static int pxa3xx_dvm_remove(struct platform_device *pdev)
+{
+	struct pxa3xx_dvm_pdata *pdata = pdev->dev.platform_data;
+
+	down(&pxa3xx_dvm_sema);
+
+	pxa3xx_dvm_set_vcore(PXA3XX_DVM_VCORE_SUFF);
+	if(pdata->pm_state_logic)
+		regulator_disable(pxa3xx_reg_vcore);
+	regulator_put(pxa3xx_reg_vcore);
+	pxa3xx_reg_vcore = NULL;
+
+	if(!pxa3xx_reg_vsram)
+		goto out;
+	pxa3xx_dvm_set_vsram(PXA3XX_DVM_VSRAM_SUFF);
+	if(pdata->pm_state_logic)
+		regulator_disable(pxa3xx_reg_vsram);
+	regulator_put(pxa3xx_reg_vsram);
+	pxa3xx_reg_vsram = NULL;
+
+out:
+	pxa3xx_allow_cpufreq_dvm = 0;
+	up(&pxa3xx_dvm_sema);
+	return 0;
+}
+
+static void pxa3xx_dvm_pm_shutdown(struct platform_device *pdev)
+{
+	struct pxa3xx_dvm_pdata *pdata = pdev->dev.platform_data;
+
+	down(&pxa3xx_dvm_sema);
+
+	pxa3xx_dvm_set_vcore(PXA3XX_DVM_VCORE_SUFF);
+	if(pxa3xx_reg_vsram)
+		pxa3xx_dvm_set_vsram(PXA3XX_DVM_VSRAM_SUFF);
+
+	if(!pdata->pm_state_logic)
+		goto out;
+	if(regulator_disable(pxa3xx_reg_vcore))
+		dev_err(&pdev->dev, "unable to disable VCC_CORE\n");
+	if(pxa3xx_reg_vsram && regulator_disable(pxa3xx_reg_vsram))
+		dev_err(&pdev->dev, "unable to disable VCC_SRAM\n");
+
+out:
+	pxa3xx_allow_cpufreq_dvm = 0;
+	up(&pxa3xx_dvm_sema);
+}
+
+#ifdef CONFIG_PM
+static int pxa3xx_dvm_pm_resume(struct platform_device *pdev)
+{
+	struct pxa3xx_dvm_pdata *pdata = pdev->dev.platform_data;
+	int ret = 0;
+
+	down(&pxa3xx_dvm_sema);
+	/* Enable reg_vcore */
+	if(pdata->pm_state_logic && regulator_enable(pxa3xx_reg_vcore))
+		dev_warn(&pdev->dev, "unable to enable VCC_CORE: %d\n", ret);
+	/* Apply correct voltages */
+	if(pxa3xx_cpufreq_dvm(pxa3xx_actual_freq, CPUFREQ_POSTCHANGE))
+		dev_warn(&pdev->dev, "unable to restore voltages: %d\n", ret);
+
+	pxa3xx_allow_cpufreq_dvm = pdata->freq_transition_logic;
+	up(&pxa3xx_dvm_sema);
+	return 0;
+}
+
+static int pxa3xx_dvm_pm_suspend(struct platform_device *pdev,
+				 pm_message_t state)
+{
+	struct pxa3xx_dvm_pdata *pdata = pdev->dev.platform_data;
+	int ret;
+
+	down(&pxa3xx_dvm_sema);
+
+	if((ret = pxa3xx_dvm_set_vcore(PXA3XX_DVM_VCORE_SUFF)))
+		goto fallback;
+	if((ret = pxa3xx_dvm_set_vsram(PXA3XX_DVM_VCORE_SUFF)))
+		goto fallback;
+
+	if(!pdata->pm_state_logic)
+		goto out;
+
+	if(pxa3xx_reg_vsram && !regulator_is_enabled(pxa3xx_reg_vsram))
+		if((ret = regulator_enable(pxa3xx_reg_vsram))) {
+			dev_err(&pdev->dev, "unable to enable VCC_SRAM\n");
+			goto fallback;
+		}
+	if((ret = regulator_disable(pxa3xx_reg_vcore))) {
+		dev_err(&pdev->dev, "unable to disable VCC_CORE\n");
+		goto fallback;
+	}
+
+out:
+	pxa3xx_allow_cpufreq_dvm = 0;
+	up(&pxa3xx_dvm_sema);
+	return 0;
+fallback:
+	dev_warn(&pdev->dev, "abort suspend\n");
+	/* Restore voltages */
+	pxa3xx_cpufreq_dvm(pxa3xx_actual_freq, CPUFREQ_POSTCHANGE);
+	up(&pxa3xx_dvm_sema);
+	return ret;
+}
+#endif
+
+static struct platform_driver pxa3xx_dvm = {
+	.probe = pxa3xx_dvm_probe,
+	.remove = pxa3xx_dvm_remove,
+	.driver = {
+		.owner = THIS_MODULE,
+		.name = "pxa3xx-dvm",
+	},
+#ifdef CONFIG_PM
+	.suspend = pxa3xx_dvm_pm_suspend,
+	.resume = pxa3xx_dvm_pm_resume,
+#endif
+	.shutdown = pxa3xx_dvm_pm_shutdown,
+};
+
 static int __init cpufreq_init(void)
 {
-	if (cpu_is_pxa3xx())
-		return cpufreq_register_driver(&pxa3xx_cpufreq_driver);
+	if (cpu_is_pxa3xx()) {
+		int ret;
+		ret = cpufreq_register_driver(&pxa3xx_cpufreq_driver);
+		if(ret)
+			return ret;
+		return platform_driver_register(&pxa3xx_dvm);
+	}
 
 	return 0;
 }
@@ -250,6 +552,7 @@ module_init(cpufreq_init);
 
 static void __exit cpufreq_exit(void)
 {
+	platform_driver_unregister(&pxa3xx_dvm);
 	cpufreq_unregister_driver(&pxa3xx_cpufreq_driver);
 }
 module_exit(cpufreq_exit);

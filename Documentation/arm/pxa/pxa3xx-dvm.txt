@@ -1,0 +1,70 @@
+		DVM (Dynamic Voltage Management) in PXA3xx SoCs
+
+Lots of boards use PXA3xx-compatible PMICs (for ex. MAX8660 8-channel PMIC).
+These PMICs are usually connected via dedicated PWR_I2C interface to SoC.
+
+PXA3xx themselves support automatic dynamic CORE and SRAM voltage scaling via
+the thing Marvell calls "voltage sequencer". This mechanism is able to send
+hard-coded commands via PWR_I2C to compatible PMIC.
+At first glance, we can use this when we have such a PMIC.
+However, we also usually want to control some other PMIC voltage regulators from
+software (for ex. to scale MMC/SD supply voltage).
+
+Thus, we need PMIC to be presented to kernel via regulator subsystem and driven
+by corresponding driver.
+Such a setup will usually lead to conflicts between software PWR_I2C driver and
+hardware voltage sequencer. So, sometimes it's a good idea to have software
+voltage sequencer, which also handles regulator states in low power modes (LPM).
+
+On this basis, DVM driver was implemented tightly coupled with PXA3xx cpufreq
+driver. Its code consists of two parts:
+	-static code, which provides voltage scaling in sync with
+		CPU frequency transitions.
+	-pxa3xx-dvm platform driver, acts as an interface with board-specific
+		code, supplies static counterpart with information about
+		VCC_APPS & VCC_SRAM regulators, and handles voltage scaling on
+		PM transitions.
+
+DVM driver implements the following logic:
+1. Frequency transitions (enabled by freq_transition_logic field in pdata)
+-Just before frequency transition, voltages are ramped up to "sufficient"
+	values, to ensure stable operation of SoC.
+-After the frequency is set, voltages are lowered to values specified in EMTS
+	for each operating point.
+See "Marvell PXA3xx processor EMTS", "5.2 Operating conditions".
+
+2. Power mode transitions
+The main idea behind this logic is that board features compatible PMIC, which
+understands PWR_EN signal correctly: if it is asserted, then, regardless of
+software configuration, VCC_APPS & VCC_SRAM are enabled and set to previously
+programmed voltages; otherwise these regulators are physically enabled only if
+enabled in software (via I2C).
+
+Also, PMIC must retain programmed voltage levels in all cases, except for power
+supply failure.
+
+Upon shutdown (S3/D4/C4 state), this driver will disable CORE and SRAM
+regulators to ensure that when PWR_EN is deasserted, regulators will be
+physically disabled, and correct power-down timing followed. Also, CORE & SRAM
+voltages are programmed to "sufficient" values to ensure succesfull power
+up.
+
+Before entering LPM (standby/suspend), driver will disable CORE regulator, and
+enable SRAM regulator. SRAM must remain powered up in all power modes except
+S3/D4/C4.
+Voltage levels when enterting LPM are programmed to "sufficient" values.
+
+Upon restore, driver will just enable CORE regulator and scale voltages
+according to operating point set by cpufreq.
+
+Note: when DVM device is probed or removed, both regulators' voltages are
+	programmed to "sufficient" values. Also, if pm_state_logic is
+	programmed, the regulators are enabled during probing, and disabled upon
+	removal.
+
+"Sufficient" voltage levels are values, which are sufficient for stable
+operation of SoC in all power modes and at all allowed frequencies.
+
+Currently, both "sufficient" VCC_CORE and VCC_SRAM are hard-coded to 1.4V, the
+voltage specified by EMTS for "S2/D3/C4, S0/D2/C2, S0/D1/C2 and 806MHz
+operation".
