@@ -655,8 +655,9 @@ static int bq27x00_read_i2c(struct bq27x00_device_info *di, u8 reg, bool single)
 static int bq27x00_battery_probe(struct i2c_client *client,
 				 const struct i2c_device_id *id)
 {
-	char *name;
+	const char *name;
 	struct bq27x00_device_info *di;
+	struct bq27000_platform_data *pdata = client->dev.platform_data;
 	int num;
 	int retval = 0;
 
@@ -670,12 +671,18 @@ static int bq27x00_battery_probe(struct i2c_client *client,
 	if (retval < 0)
 		return retval;
 
-	name = kasprintf(GFP_KERNEL, "%s-%d", id->name, num);
+	/* Provide way to override battery name */
+	if(pdata && pdata->name)
+		name = pdata->name;
+	else
+		name = kasprintf(GFP_KERNEL, "%s-%d", id->name, num);
+
 	if (!name) {
-		dev_err(&client->dev, "failed to allocate device name\n");
+		dev_err(&client->dev, "failed to allocate dev name\n");
 		retval = -ENOMEM;
 		goto batt_failed_1;
 	}
+
 
 	di = kzalloc(sizeof(*di), GFP_KERNEL);
 	if (!di) {
