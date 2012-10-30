@@ -118,6 +118,15 @@ config SND_PXA2XX_SOC_PALM27X
 	  Say Y if you want to add support for SoC audio on
 	  Palm T|X, T5, E2 or LifeDrive handheld computer.
 
+config SND_SOC_ETABLET
+	tristate "SoC AC97 Audio support for EeeNote"
+	depends on SND_PXA2XX_SOC && MACH_ETABLET
+	select SND_PXA2XX_SOC_AC97
+	select SND_SOC_RT5611
+	help
+	  Say Y if you want to add support for SoC audio on the
+	  Asus EeeNote EA-800 (ALC5611 codec)
+
 config SND_SOC_SAARB
 	tristate "SoC Audio support for Marvell Saarb"
 	depends on SND_PXA2XX_SOC && MACH_SAARB
