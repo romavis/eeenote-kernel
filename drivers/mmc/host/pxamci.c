@@ -641,7 +641,7 @@ static int pxamci_probe(struct platform_device *pdev)
 
 	pxamci_init_ocr(host);
 
-	mmc->caps = 0;
+	mmc->caps = MMC_CAP_POWER_OFF_CARD;
 	host->cmdat = 0;
 	if (!cpu_is_pxa25x()) {
 		mmc->caps |= MMC_CAP_4_BIT_DATA | MMC_CAP_SDIO_IRQ;
