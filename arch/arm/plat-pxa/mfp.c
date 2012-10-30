@@ -161,6 +161,32 @@ static inline void __mfp_config_lpm(struct mfp_pin *p)
 	}
 }
 
+int mfp_af0_set_edge_clear(int mfp, unsigned int val)
+{
+	unsigned long mfpr, flags;
+	int ret = -EINVAL;
+
+	BUG_ON(mfp < 0 || mfp >= MFP_PIN_MAX);
+
+	spin_lock_irqsave(&mfp_spin_lock, flags);
+	mfpr = mfpr_readl(mfp_table[mfp].mfpr_off);
+
+	/* Check for AF == 0x0 */
+	if((mfpr & 0x7) == 0x0) {
+		if(val)
+			mfpr |= MFPR_EDGE_CLEAR;
+		else
+			mfpr &= ~MFPR_EDGE_CLEAR;
+
+		mfpr_writel(mfp_table[mfp].mfpr_off, mfpr);
+		mfpr_sync();
+		ret = 0;
+	}
+	spin_unlock_irqrestore(&mfp_spin_lock, flags);
+
+	return ret;
+}
+
 void mfp_config(unsigned long *mfp_cfgs, int num)
 {
 	unsigned long flags;

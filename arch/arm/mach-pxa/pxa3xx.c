@@ -21,6 +21,7 @@
 #include <linux/io.h>
 #include <linux/syscore_ops.h>
 #include <linux/i2c/pxa-i2c.h>
+#include <linux/gpio-pxa.h>
 
 #include <asm/mach/map.h>
 #include <asm/suspend.h>
@@ -32,6 +33,8 @@
 #include <mach/dma.h>
 #include <mach/smemc.h>
 #include <mach/irqs.h>
+
+#include <plat/mfp.h>
 
 #include "generic.h"
 #include "devices.h"
@@ -100,6 +103,83 @@ static struct clk_lookup pxa3xx_clkregs[] = {
 
 static void __iomem *sram;
 static unsigned long wakeup_src;
+
+struct pxa3xx_wakeup_gpio {
+	unsigned int num;
+	unsigned int wakeup_enabled;
+};
+
+#define DEF_WAKEUP_GPIO(n) { .num = (n), .wakeup_enabled = 0, }
+
+#if defined(CONFIG_CPU_PXA300) || defined(CONFIG_CPU_PXA310)
+static struct pxa3xx_wakeup_gpio pxa3xx_gpio_wakeups[] = {
+	DEF_WAKEUP_GPIO(0),
+	DEF_WAKEUP_GPIO(1),
+	DEF_WAKEUP_GPIO(2),
+	DEF_WAKEUP_GPIO(53),
+	DEF_WAKEUP_GPIO(76),
+	DEF_WAKEUP_GPIO(83),
+	DEF_WAKEUP_GPIO(127),
+};
+#elif defined(CONFIG_CPU_PXA320)
+static struct pxa3xx_wakeup_gpio pxa3xx_gpio_wakeups[] = {
+	DEF_WAKEUP_GPIO(0),
+	DEF_WAKEUP_GPIO(1),
+	DEF_WAKEUP_GPIO(2),
+	DEF_WAKEUP_GPIO(3),
+	DEF_WAKEUP_GPIO(4),
+	DEF_WAKEUP_GPIO(9),
+};
+#else
+static struct pxa3xx_wakeup_gpio pxa3xx_gpio_wakeups[] = {};
+#endif
+
+/*
+ * Called from pxa3xx_cpu_pm_enter to setup MFPR registers before suspend
+ * Also checks that corresponding MFPs are configured as GPIO (AF0)
+ *
+ * Returns 0 if there are no GPIO wake up sources active, otherwise 1
+ */
+static int pxa3xx_gpio_wake_confpins()
+{
+	int ret, pin, wakeupable = 0;
+	unsigned int ec, i;
+
+	for(i = 0; i < ARRAY_SIZE(pxa3xx_gpio_wakeups); ++i) {
+		ec = !pxa3xx_gpio_wakeups[i].wakeup_enabled;
+		if(ec)
+			continue;
+
+		pin = MFP_PIN_GPIO0 + pxa3xx_gpio_wakeups[i].num;
+		ret = mfp_af0_set_edge_clear(pin, ec);
+		if(!ret)
+			wakeupable = 1;
+		/* For GPIOx_2 (x=0,1) */
+		if(pin < 2) {
+			pin = MFP_PIN_GPIO0_2 + pxa3xx_gpio_wakeups[i].num;
+			ret = mfp_af0_set_edge_clear(pin, ec);
+			if(!ret)
+				wakeupable = 1;
+		}
+	}
+	return wakeupable;
+}
+
+/*
+ * GPIO "interrupt controller" (gpio-pxa.c) gpio_set_wake callback
+ * Called to mark specified GPIO as "allowed to wake up"
+ * Returns EINVAL if specified GPIO is not a wake up source
+ */
+static int pxa3xx_gpio_wake_set(unsigned int gpio, unsigned int on)
+{
+	unsigned int i;
+	for(i = 0; i < ARRAY_SIZE(pxa3xx_gpio_wakeups); ++i)
+		if(pxa3xx_gpio_wakeups[i].num == gpio) {
+			pxa3xx_gpio_wakeups[i].wakeup_enabled = on;
+			return 0;
+		}
+	return -EINVAL;
+}
 
 /*
  * Enter a standby mode (S0D1C2 or S0D2C2).  Upon wakeup, the dynamic
@@ -182,6 +262,9 @@ static void pxa3xx_cpu_pm_suspend(void)
 
 static void pxa3xx_cpu_pm_enter(suspend_state_t state)
 {
+	/* If there are GPIO wakeups, enable GEN12 event */
+	if(pxa3xx_gpio_wake_confpins())
+		wakeup_src |= ADXER_MFP_GEN12;
 	/*
 	 * Don't sleep if no wakeup sources are defined
 	 */
@@ -330,6 +413,7 @@ static int pxa3xx_set_wake(struct irq_data *d, unsigned int on)
 #else
 static inline void pxa3xx_init_pm(void) {}
 #define pxa3xx_set_wake	NULL
+#define pxa3xx_gpio_wake_set NULL
 #endif
 
 static void pxa_ack_ext_wakeup(struct irq_data *d)
@@ -419,8 +503,11 @@ void __init pxa3xx_set_i2c_power_info(struct i2c_pxa_platform_data *info)
 	pxa_register_device(&pxa3xx_device_i2c_power, info);
 }
 
+static struct pxa_gpio_platform_data pxa3xx_gpio_pdata = {
+	.gpio_set_wake = pxa3xx_gpio_wake_set,
+};
+
 static struct platform_device *devices[] __initdata = {
-	&pxa_device_gpio,
 	&pxa27x_device_udc,
 	&pxa_device_pmu,
 	&pxa_device_i2s,
@@ -466,6 +553,7 @@ static int __init pxa3xx_init(void)
 		register_syscore_ops(&pxa3xx_mfp_syscore_ops);
 		register_syscore_ops(&pxa3xx_clock_syscore_ops);
 
+		pxa_register_device(&pxa_device_gpio, &pxa3xx_gpio_pdata);
 		ret = platform_add_devices(devices, ARRAY_SIZE(devices));
 	}
 

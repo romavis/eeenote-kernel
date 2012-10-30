@@ -464,12 +464,14 @@ void __init mfp_init_addr(struct mfp_addr_map *map);
  * mfp_config()		- for configuring a group of MFPR registers
  * mfp_config_lpm()	- configuring all low power MFPR registers for suspend
  * mfp_config_run()	- configuring all run time  MFPR registers after resume
+ * mfp_af0_set_edge_clear() - set EDGE_CLEAR for AF0 configured pin
  */
 unsigned long mfp_read(int mfp);
 void mfp_write(int mfp, unsigned long mfpr_val);
 void mfp_config(unsigned long *mfp_cfgs, int num);
 void mfp_config_run(void);
 void mfp_config_lpm(void);
+int mfp_af0_set_edge_clear(int mfp, unsigned int val);
 #endif /* CONFIG_PXA3xx || CONFIG_PXA95x || CONFIG_ARCH_MMP */
 
 #endif /* __ASM_PLAT_MFP_H */
