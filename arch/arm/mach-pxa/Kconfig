@@ -280,6 +280,10 @@ config MACH_VPAC270
 	  PXA270 based Single Board Computer.
 
 comment "End-user Products (sorted by vendor name)"
+config MACH_ETABLET
+	bool "ASUS EeeNote EA-800"
+	select CPU_PXA300
+	select PXA3xx
 
 config MACH_H4700
 	bool "HP iPAQ hx4700"
