@@ -24,6 +24,19 @@ config MMC_PXA
 
 	  If unsure, say N.
 
+config MMC_PXA_MULTI
+	tristate "Intel PXA MMC host driver, multi cards per controller support (UNSTABLE)"
+	depends on ARCH_PXA && EXPERIMENTAL
+	help
+	  This selects driver for PXA MMC controller with multiple cards per controller support
+	  
+	  PXA doesn't support hardware card switching mechanism, so in wide bus mode (4bit) it natively supports only one card per controller.
+	  This is workaround for that limitation ;)
+	  
+	  However, machine description must provide card selection routines through platform_data
+	  
+	  If unsure, say N.
+
 config MMC_SDHCI
 	tristate "Secure Digital Host Controller Interface support"
 	depends on HAS_DMA
