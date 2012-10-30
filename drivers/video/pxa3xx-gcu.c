@@ -30,6 +30,12 @@
  * your bootloader for now.
  */
 
+/*
+ * 31 Aug 2012 (C) Roman Dobrodiy
+ * Some code rewritten to make things simpler
+ * Instruction batches are organized in ring buffer-like structure
+ */
+
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/dma-mapping.h>
@@ -44,6 +50,7 @@
 #include <linux/clk.h>
 #include <linux/fs.h>
 #include <linux/io.h>
+#include <linux/list.h>
 
 #include "pxa3xx-gcu.h"
 
@@ -66,6 +73,7 @@
 
 #define IE_EOB		(1 << 0)
 #define IE_EEOB		(1 << 5)
+#define IE_BF		(1 << 2)
 #define IE_ALL		0xff
 
 #define SHARED_SIZE	PAGE_ALIGN(sizeof(struct pxa3xx_gcu_shared))
@@ -92,6 +100,19 @@ struct pxa3xx_gcu_batch {
 	u32			*ptr;
 	dma_addr_t		 phys;
 	unsigned long		 length;
+	int			 filled;
+};
+
+struct pxa3xx_gcu_buffer_priv {
+	unsigned int		id;	/* Unique buffer ID */
+	unsigned int		ref_vma;
+	unsigned int		ref_fd;
+
+	void			*ptr;	/* Kernel space vmem ptr */
+	unsigned long		phys;	/* Address in physical memory */
+	unsigned int		size;	/* Length of a buffer */
+
+	struct list_head	list;
 };
 
 struct pxa3xx_gcu_priv {
@@ -107,11 +128,18 @@ struct pxa3xx_gcu_priv {
 	spinlock_t		  spinlock;
 	struct timeval 		  base_time;
 
-	struct pxa3xx_gcu_batch *free;
+	struct pxa3xx_gcu_batch *free;		/* Currently free batch */
 
-	struct pxa3xx_gcu_batch *ready;
-	struct pxa3xx_gcu_batch *ready_last;
-	struct pxa3xx_gcu_batch *running;
+	struct pxa3xx_gcu_batch *exec_first;	/* First batch in exec chain */
+	struct pxa3xx_gcu_batch *exec_last;	/* Last batch in exec chain */
+	struct pxa3xx_gcu_batch *filled_last;	/* Last filled batch
+						 * yet not in exec chain */
+
+	struct pxa3xx_gcu_batch *first;		/* Ring buffer head */
+	struct pxa3xx_gcu_batch *last;		/* Ring buffer tail */
+
+	/* Scratchpad buffer list */
+	struct list_head 	buffers;
 };
 
 static inline unsigned long
@@ -153,6 +181,7 @@ gc_writel(struct pxa3xx_gcu_priv *priv, unsigned int off, unsigned long val)
 static void
 pxa3xx_gcu_reset(struct pxa3xx_gcu_priv *priv)
 {
+	struct pxa3xx_gcu_batch *batch;
 	QDUMP("RESET");
 
 	/* disable interrupts */
@@ -166,15 +195,23 @@ pxa3xx_gcu_reset(struct pxa3xx_gcu_priv *priv)
 	priv->shared->buffer_phys = priv->shared_phys;
 	priv->shared->magic = PXA3XX_GCU_SHARED_MAGIC;
 
-	do_gettimeofday(&priv->base_time);
 
+	do_gettimeofday(&priv->base_time);
 	/* set up the ring buffer pointers */
 	gc_writel(priv, REG_GCRBLR, 0);
 	gc_writel(priv, REG_GCRBBR, priv->shared_phys);
 	gc_writel(priv, REG_GCRBTR, priv->shared_phys);
 
-	/* enable all IRQs except EOB */
-	gc_writel(priv, REG_GCIECR, IE_ALL & ~IE_EOB);
+	/* reset all batches */
+	batch = priv->first;
+	do {
+		batch->filled = 0;
+		batch = batch->next;
+	} while (batch != priv->first);
+	priv->free = priv->first;
+
+	/* enable all IRQs except EOB & BF */
+	gc_writel(priv, REG_GCIECR, IE_ALL & ~(IE_EOB | IE_BF));
 }
 
 static void
@@ -197,27 +234,11 @@ dump_whole_state(struct pxa3xx_gcu_priv *priv)
 }
 
 static void
-flush_running(struct pxa3xx_gcu_priv *priv)
-{
-	struct pxa3xx_gcu_batch *running = priv->running;
-	struct pxa3xx_gcu_batch *next;
-
-	while (running) {
-		next = running->next;
-		running->next = priv->free;
-		priv->free = running;
-		running = next;
-	}
-
-	priv->running = NULL;
-}
-
-static void
 run_ready(struct pxa3xx_gcu_priv *priv)
 {
 	unsigned int num = 0;
 	struct pxa3xx_gcu_shared *shared = priv->shared;
-	struct pxa3xx_gcu_batch	*ready = priv->ready;
+	struct pxa3xx_gcu_batch	*ready = priv->exec_first;
 
 	QDUMP("Start");
 
@@ -225,15 +246,17 @@ run_ready(struct pxa3xx_gcu_priv *priv)
 
 	shared->buffer[num++] = 0x05000000;
 
-	while (ready) {
+	while(1) {
 		shared->buffer[num++] = 0x00000001;
 		shared->buffer[num++] = ready->phys;
+		if(!ready->next->filled || ready->next == priv->exec_first)
+			break;
 		ready = ready->next;
 	}
 
+	priv->exec_last = ready;
 	shared->buffer[num++] = 0x05000000;
-	priv->running = priv->ready;
-	priv->ready = priv->ready_last = NULL;
+
 	gc_writel(priv, REG_GCRBLR, 0);
 	shared->hw_running = 1;
 
@@ -252,6 +275,7 @@ pxa3xx_gcu_handle_irq(int irq, void *ctx)
 {
 	struct pxa3xx_gcu_priv *priv = ctx;
 	struct pxa3xx_gcu_shared *shared = priv->shared;
+	struct pxa3xx_gcu_batch *buffer;
 	u32 status = gc_readl(priv, REG_GCISCR) & IE_ALL;
 
 	QDUMP("-Interrupt");
@@ -265,10 +289,19 @@ pxa3xx_gcu_handle_irq(int irq, void *ctx)
 	if (status & IE_EEOB) {
 		QDUMP(" [EEOB]");
 
-		flush_running(priv);
+		buffer = priv->exec_first;
+		do {
+			buffer->filled = 0;
+			buffer = buffer->next;
+		} while (buffer != priv->exec_last);
+		buffer->filled = 0;
+
+		priv->free = priv->exec_first;
+
 		wake_up_all(&priv->wait_free);
 
-		if (priv->ready) {
+		if (buffer->next->filled) {
+			priv->exec_first = buffer->next;
 			run_ready(priv);
 		} else {
 			/* There is no more data prepared by the userspace.
@@ -323,7 +356,7 @@ pxa3xx_gcu_wait_idle(struct pxa3xx_gcu_priv *priv)
 			continue;
 
 		if (gc_readl(priv, REG_GCRBEXHR) == rbexhr &&
-		    priv->shared->num_interrupts == num) {
+		priv->shared->num_interrupts == num) {
 			QERROR("TIMEOUT");
 			ret = -ETIMEDOUT;
 			break;
@@ -350,7 +383,7 @@ pxa3xx_gcu_wait_free(struct pxa3xx_gcu_priv *priv)
 		u32 rbexhr = gc_readl(priv, REG_GCRBEXHR);
 
 		ret = wait_event_interruptible_timeout(priv->wait_free,
-						       priv->free, HZ*4);
+						priv->free, HZ*4);
 
 		if (ret < 0)
 			break;
@@ -370,11 +403,31 @@ pxa3xx_gcu_wait_free(struct pxa3xx_gcu_priv *priv)
 	return ret;
 }
 
+/* Scratchpad buffer ops */
+
+/*
+ * Buffer "garbage collection"
+ * Try to free memory and remove buffer
+ * Buffer is freed if and only if ref_fd == 0 && ref_vma == 0
+ * i.e. it is not referenced by any struct file* and mmap-ed
+ */
+static void pxa3xx_gcu_buffer_cleanup(struct pxa3xx_gcu_buffer_priv *buffer)
+{
+	printk(KERN_INFO "pxa3xx-gcu: cleanup %d fdref %d vmaref %d",\
+		buffer->id, buffer->ref_fd, buffer->ref_vma);
+	if(buffer->ref_vma || buffer->ref_fd)
+		return;
+	/* Remove it from the buffer list */
+	list_del(&buffer->list);
+	/* Free mem */
+	free_pages_exact(buffer->ptr, buffer->size);
+}
+
 /* Misc device layer */
 
 static ssize_t
 pxa3xx_gcu_misc_write(struct file *filp, const char *buff,
-		      size_t count, loff_t *offp)
+		size_t count, loff_t *offp)
 {
 	int ret;
 	unsigned long flags;
@@ -385,7 +438,7 @@ pxa3xx_gcu_misc_write(struct file *filp, const char *buff,
 	int words = count / 4;
 
 	/* Does not need to be atomic. There's a lock in user space,
-	 * but anyhow, this is just for statistics. */
+	* but anyhow, this is just for statistics. */
 	priv->shared->num_writes++;
 
 	priv->shared->num_words += words;
@@ -408,6 +461,9 @@ pxa3xx_gcu_misc_write(struct file *filp, const char *buff,
 
 	buffer = priv->free;
 	priv->free = buffer->next;
+	/* If there are no free buffers left in fact */
+	if(priv->free->filled)
+		priv->free = NULL;
 
 	spin_unlock_irqrestore(&priv->spinlock, flags);
 
@@ -416,7 +472,6 @@ pxa3xx_gcu_misc_write(struct file *filp, const char *buff,
 	ret = copy_from_user(buffer->ptr, buff, words * 4);
 	if (ret) {
 		spin_lock_irqsave(&priv->spinlock, flags);
-		buffer->next = priv->free;
 		priv->free = buffer;
 		spin_unlock_irqrestore(&priv->spinlock, flags);
 		return -EFAULT;
@@ -428,20 +483,15 @@ pxa3xx_gcu_misc_write(struct file *filp, const char *buff,
 	buffer->ptr[words] = 0x01000000;
 
 	/*
-	 * Add buffer to ready list
+	 * Add buffer to filled list, and probably run batches
 	 */
 	spin_lock_irqsave(&priv->spinlock, flags);
 
-	buffer->next = NULL;
+	buffer->filled = 1;
+	if (priv->exec_first == NULL)
+		priv->exec_first = buffer;
 
-	if (priv->ready) {
-		BUG_ON(priv->ready_last == NULL);
-
-		priv->ready_last->next = buffer;
-	} else
-		priv->ready = buffer;
-
-	priv->ready_last = buffer;
+	priv->filled_last = buffer;
 
 	if (!priv->shared->hw_running)
 		run_ready(priv);
@@ -458,6 +508,10 @@ pxa3xx_gcu_misc_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	unsigned long flags;
 	struct pxa3xx_gcu_priv *priv =
 		container_of(filp->f_op, struct pxa3xx_gcu_priv, misc_fops);
+	struct pxa3xx_gcu_buffer buff;
+	struct pxa3xx_gcu_buffer_priv *buff_priv, *file_buff;
+
+	file_buff = (struct pxa3xx_gcu_buffer_priv*) filp->private_data;
 
 	switch (cmd) {
 	case PXA3XX_GCU_IOCTL_RESET:
@@ -468,10 +522,104 @@ pxa3xx_gcu_misc_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 	case PXA3XX_GCU_IOCTL_WAIT_IDLE:
 		return pxa3xx_gcu_wait_idle(priv);
+
+	case PXA3XX_GCU_IOCTL_B_GETINFO:
+		if(file_buff == NULL)
+			return -ENXIO;
+
+		buff.id = file_buff->id;
+		buff.length = file_buff->size;
+		buff.phys = file_buff->phys;
+		return copy_to_user((void *) arg, &buff,\
+				sizeof(struct pxa3xx_gcu_buffer));
+
+	case PXA3XX_GCU_IOCTL_B_ATTACH:
+		list_for_each_entry(buff_priv, &priv->buffers, list)
+			if(buff_priv->id == (unsigned int) arg) {
+				/* Found requested buffer */
+				if(file_buff) {
+					file_buff->ref_fd--;
+					pxa3xx_gcu_buffer_cleanup(file_buff);
+				}
+				buff_priv->ref_fd++;
+				filp->private_data = buff_priv;
+				return 0;
+			}
+		/* Requested ID not found */
+		return -ENXIO;
+
+	case PXA3XX_GCU_IOCTL_B_ALLOC:
+		buff_priv = kzalloc(sizeof(struct pxa3xx_gcu_buffer_priv),\
+					GFP_KERNEL);
+		if(buff_priv == NULL)
+			return -ENOMEM;
+
+		buff_priv->size = (unsigned int) arg;
+		if(buff_priv->size > PXA3XX_GCU_BUFFER_MAXSZ) {
+			kfree(buff_priv);
+			return -EINVAL;
+		}
+		buff_priv->ptr = alloc_pages_exact(buff_priv->size, GFP_KERNEL);
+		if(buff_priv->ptr == NULL) {
+			kfree(buff_priv);
+			return -ENOMEM;
+		}
+		buff_priv->phys = virt_to_phys(buff_priv->ptr);
+
+		/* Here UID generation comes.. Ha ha */
+		buff_priv->id = (unsigned int) buff_priv->phys;
+		list_add(&buff_priv->list, &priv->buffers);
+
+		/* Dereference old buffer */
+		if(file_buff) {
+			file_buff->ref_fd--;
+			pxa3xx_gcu_buffer_cleanup(file_buff);
+		}
+
+		buff_priv->ref_fd++;
+		filp->private_data = buff_priv;
+
+		return 0;
+
+	case PXA3XX_GCU_IOCTL_B_FREE:
+		if(file_buff == NULL)
+			return -ENXIO;
+		file_buff->ref_fd--;
+		pxa3xx_gcu_buffer_cleanup(file_buff);
+		filp->private_data = NULL;
+
+		return 0;
 	}
 
 	return -ENOSYS;
 }
+
+/* This is needed to count VMA references to buffers */
+static void pxa3xx_gcu_vma_open(struct vm_area_struct *vma)
+{
+	struct pxa3xx_gcu_buffer_priv *buff_priv;
+	buff_priv = (struct pxa3xx_gcu_buffer_priv*) vma->vm_private_data;
+	BUG_ON(buff_priv == NULL);
+	buff_priv->ref_vma++;
+	printk(KERN_INFO "pxa3xx-gcu: buff %d fdref %d vmaref %d\n",\
+		buff_priv->id, buff_priv->ref_fd, buff_priv->ref_vma);
+}
+
+static void pxa3xx_gcu_vma_close(struct vm_area_struct *vma)
+{
+	struct pxa3xx_gcu_buffer_priv *buff_priv;
+	buff_priv = (struct pxa3xx_gcu_buffer_priv*) vma->vm_private_data;
+	BUG_ON(buff_priv == NULL);
+	buff_priv->ref_vma--;
+	printk(KERN_INFO "pxa3xx-gcu: buff %d fdref %d vmaref %d\n",\
+		buff_priv->id, buff_priv->ref_fd, buff_priv->ref_vma);
+	pxa3xx_gcu_buffer_cleanup(buff_priv);
+}
+
+static struct vm_operations_struct pxa3xx_gcu_vma_ops = {
+	.open = pxa3xx_gcu_vma_open,
+	.close = pxa3xx_gcu_vma_close,
+};
 
 static int
 pxa3xx_gcu_misc_mmap(struct file *filp, struct vm_area_struct *vma)
@@ -479,7 +627,8 @@ pxa3xx_gcu_misc_mmap(struct file *filp, struct vm_area_struct *vma)
 	unsigned int size = vma->vm_end - vma->vm_start;
 	struct pxa3xx_gcu_priv *priv =
 		container_of(filp->f_op, struct pxa3xx_gcu_priv, misc_fops);
-
+	struct pxa3xx_gcu_buffer_priv *file_buff;
+	
 	switch (vma->vm_pgoff) {
 	case 0:
 		/* hand out the shared data area */
@@ -501,6 +650,22 @@ pxa3xx_gcu_misc_mmap(struct file *filp, struct vm_area_struct *vma)
 		return io_remap_pfn_range(vma, vma->vm_start,
 				priv->resource_mem->start >> PAGE_SHIFT,
 				size, vma->vm_page_prot);
+	case 1 + (SHARED_SIZE >> PAGE_SHIFT):
+		/* Try to mmap buffer associated with filp */
+		file_buff = (struct pxa3xx_gcu_buffer_priv*) filp->private_data;
+		if(file_buff == NULL)
+			return -ENXIO;
+		if(size != file_buff->size)
+			return -EINVAL;
+
+		vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+		vma->vm_ops = &pxa3xx_gcu_vma_ops;
+		vma->vm_private_data = filp->private_data;
+
+		return remap_pfn_range(vma, vma->vm_start,
+				file_buff->phys >> PAGE_SHIFT,
+				size, vma->vm_page_prot);
+		pxa3xx_gcu_vma_open(vma);
 	}
 
 	return -EINVAL;
@@ -535,7 +700,7 @@ static inline void pxa3xx_gcu_init_debug_timer(void) {}
 
 static int
 add_buffer(struct platform_device *dev,
-	   struct pxa3xx_gcu_priv *priv)
+	struct pxa3xx_gcu_priv *priv)
 {
 	struct pxa3xx_gcu_batch *buffer;
 
@@ -544,37 +709,46 @@ add_buffer(struct platform_device *dev,
 		return -ENOMEM;
 
 	buffer->ptr = dma_alloc_coherent(&dev->dev, PXA3XX_GCU_BATCH_WORDS * 4,
-					 &buffer->phys, GFP_KERNEL);
+					&buffer->phys, GFP_KERNEL);
 	if (!buffer->ptr) {
 		kfree(buffer);
 		return -ENOMEM;
 	}
 
-	buffer->next = priv->free;
+	if(priv->first == NULL)
+		priv->first = priv->last = buffer;
 
-	priv->free = buffer;
+	buffer->next = priv->first;
+	priv->last->next = buffer;
+	priv->last = buffer;
 
+	if(priv->free == NULL)
+		priv->free = buffer;
 	return 0;
 }
 
 static void
 free_buffers(struct platform_device *dev,
-	     struct pxa3xx_gcu_priv *priv)
+	struct pxa3xx_gcu_priv *priv)
 {
-	struct pxa3xx_gcu_batch *next, *buffer = priv->free;
+	struct pxa3xx_gcu_batch *next, *buffer = priv->first;
 
-	while (buffer) {
+	if(!buffer)
+		return;
+	do {
 		next = buffer->next;
 
 		dma_free_coherent(&dev->dev, PXA3XX_GCU_BATCH_WORDS * 4,
-				  buffer->ptr, buffer->phys);
+				buffer->ptr, buffer->phys);
 
 		kfree(buffer);
 
 		buffer = next;
-	}
+	} while (buffer != priv->first);
 
 	priv->free = NULL;
+	priv->first = NULL;
+	priv->last = NULL;
 }
 
 static int __devinit
@@ -596,6 +770,7 @@ pxa3xx_gcu_probe(struct platform_device *dev)
 		}
 	}
 
+	INIT_LIST_HEAD(&priv->buffers);
 	init_waitqueue_head(&priv->wait_idle);
 	init_waitqueue_head(&priv->wait_free);
 	spin_lock_init(&priv->spinlock);
@@ -645,7 +820,7 @@ pxa3xx_gcu_probe(struct platform_device *dev)
 
 	/* allocate dma memory */
 	priv->shared = dma_alloc_coherent(&dev->dev, SHARED_SIZE,
-					  &priv->shared_phys, GFP_KERNEL);
+					&priv->shared_phys, GFP_KERNEL);
 
 	if (!priv->shared) {
 		dev_err(&dev->dev, "failed to allocate DMA memory\n");
@@ -676,7 +851,7 @@ pxa3xx_gcu_probe(struct platform_device *dev)
 	}
 
 	ret = request_irq(irq, pxa3xx_gcu_handle_irq,
-			  0, DRV_NAME, priv);
+			0, DRV_NAME, priv);
 	if (ret) {
 		dev_err(&dev->dev, "request_irq failed\n");
 		ret = -EBUSY;
