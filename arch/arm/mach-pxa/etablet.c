@@ -38,6 +38,7 @@
 #include <mach/mmc-multi.h>
 #include <mach/mmc.h>
 #include <mach/ohci.h>
+#include <mach/pxa3xx-dvm.h>
 
 #include <mach/etablet.h>
 
@@ -743,9 +744,17 @@ static struct platform_device zetablet_device_audio = {
 };
 
 /* Software dynamic voltage management */
+static struct pxa3xx_dvm_pdata zetablet_dvm_pdata = {
+	.freq_transition_logic = 1,
+	.pm_state_logic = 1,
+};
+
 static struct platform_device zetablet_device_dvm = {
 	.name		= "pxa3xx-dvm",
 	.id		= -1,
+	.dev		= {
+		.platform_data	= &zetablet_dvm_pdata,
+	},
 };
 
 /* Syscore ops for suspend/resume hacking */
