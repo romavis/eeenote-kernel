@@ -155,7 +155,7 @@ static inline int _vcomp(int volt_req, int volt_curr)
 {
 	if(volt_curr > volt_req + PXA3XX_DVM_TOL)
 		return 1;
-	else if (volt_curr < volt_req - PXA3XX_DVM_TOL))
+	else if (volt_curr < volt_req - PXA3XX_DVM_TOL)
 		return -1;
 	return 0;
 }
