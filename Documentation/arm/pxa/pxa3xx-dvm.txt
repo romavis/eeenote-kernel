@@ -1,5 +1,7 @@
 		DVM (Dynamic Voltage Management) in PXA3xx SoCs
 
+		I. Why do we need this?
+
 Lots of boards use PXA3xx-compatible PMICs (for ex. MAX8660 8-channel PMIC).
 These PMICs are usually connected via dedicated PWR_I2C interface to SoC.
 
@@ -10,35 +12,52 @@ At first glance, we can use this when we have such a PMIC.
 However, we also usually want to control some other PMIC voltage regulators from
 software (for ex. to scale MMC/SD supply voltage).
 
-Thus, we need PMIC to be presented to kernel via regulator subsystem and driven
-by corresponding driver.
+Thus, we need PMIC to be presented to the kernel via regulator subsystem and
+driven by a corresponding driver.
 Such a setup will usually lead to conflicts between software PWR_I2C driver and
-hardware voltage sequencer. So, sometimes it's a good idea to have software
-voltage sequencer, which also handles regulator states in low power modes (LPM).
+hardware voltage sequencer [1].
+
+All in all, sometimes it's a good idea to have software voltage sequencer
+which also controls regulators' states during power modes changes.
 
 On this basis, DVM driver was implemented tightly coupled with PXA3xx cpufreq
 driver. Its code consists of two parts:
 	-static code, which provides voltage scaling in sync with
 		CPU frequency transitions.
-	-pxa3xx-dvm platform driver, acts as an interface with board-specific
+	-pxa3xx-dvm platform driver, acts as an interface for board-specific
 		code, supplies static counterpart with information about
 		VCC_APPS & VCC_SRAM regulators, and handles voltage scaling on
 		PM transitions.
 
-DVM driver implements the following logic:
-1. Frequency transitions (enabled by freq_transition_logic field in pdata)
--Just before frequency transition, voltages are ramped up to "sufficient"
-	values, to ensure stable operation of SoC.
--After the frequency is set, voltages are lowered to values specified in EMTS
-	for each operating point.
-See "Marvell PXA3xx processor EMTS", "5.2 Operating conditions".
+[1] See Marvell PXA3xx processor Developer's Manual, Vol. I
+	chapter 6.8.1 "Programming restrictions for the PWR_I2C"
 
-2. Power mode transitions
+		II. Hard-coded values
+
+1. Regulator tolerance (PXA3XX_DVM_TOL):	+-10mV
+2. VCC_CORE (VCC_APPS) "shutdown" voltage:	1.4V
+3. VCC_SRAM "shutdown" voltage:			1.4V
+4. VCC_CORE (VCC_APPS) "suspend" voltage:	1.4V
+5. VCC_SRAM "suspend" voltage:			1.4V
+
+For more information, see:
+	Marvell PXA3xx processor EMTS, chapter 5.2 "Operating conditions".
+
+		III. Implementation details
+
+1. Frequency transition voltage scaling
+On each frequency transition driver compares targeted OP voltage with applied
+one. If the former is greater (by at least "tolerance" value), then it will be
+applied before frequency change. Otherwise, it will be applied after the change.
+
+This kind of voltage scaling is enabled by freq_transition_logic field in pdata.
+
+2. Power mode transitions (enabled by pm_state_logic field in pdata)
 The main idea behind this logic is that board features compatible PMIC, which
 understands PWR_EN signal correctly: if it is asserted, then, regardless of
-software configuration, VCC_APPS & VCC_SRAM are enabled and set to previously
-programmed voltages; otherwise these regulators are physically enabled only if
-enabled in software (via I2C).
+software regulator configuration, VCC_APPS & VCC_SRAM are enabled and set to
+previously programmed voltages; otherwise these regulators are physically
+enabled only if enabled in software (via regulator_enable).
 
 Also, PMIC must retain programmed voltage levels in all cases, except for power
 supply failure.
@@ -46,25 +65,49 @@ supply failure.
 Upon shutdown (S3/D4/C4 state), this driver will disable CORE and SRAM
 regulators to ensure that when PWR_EN is deasserted, regulators will be
 physically disabled, and correct power-down timing followed. Also, CORE & SRAM
-voltages are programmed to "sufficient" values to ensure succesfull power
+voltages are programmed to "shutdown" values to ensure succesfull power
 up.
 
-Before entering LPM (standby/suspend), driver will disable CORE regulator, and
-enable SRAM regulator. SRAM must remain powered up in all power modes except
-S3/D4/C4.
-Voltage levels when enterting LPM are programmed to "sufficient" values.
+Before entering LPM (on device's suspend() callback), driver will disable CORE
+regulator, and enable SRAM regulator. SRAM must remain powered up in all power
+modes except S3/D4/C4.
+In this case, voltages are programmed to "suspend" values.
 
 Upon restore, driver will just enable CORE regulator and scale voltages
 according to operating point set by cpufreq.
 
-Note: when DVM device is probed or removed, both regulators' voltages are
-	programmed to "sufficient" values. Also, if pm_state_logic is
-	programmed, the regulators are enabled during probing, and disabled upon
-	removal.
+Note:	if pm_state_logic is set, the regulators are also enabled during device
+	probing, and disabled upon removal.
 
-"Sufficient" voltage levels are values, which are sufficient for stable
-operation of SoC in all power modes and at all allowed frequencies.
+		IV. How to use
 
-Currently, both "sufficient" VCC_CORE and VCC_SRAM are hard-coded to 1.4V, the
-voltage specified by EMTS for "S2/D3/C4, S0/D2/C2, S0/D1/C2 and 806MHz
-operation".
+First of all, you must provide VCC_CORE and VCC_SRAM regulators to DVM
+platform device. Just register "pxa3xx-dvm" as a consumer for your regulators
+by connecting regulators to "VCC_CORE" and "VCC_SRAM" device supplies:
+
+static struct regulator_consumer_supply reg_vcore_supplies[] = {
+	REGULATOR_SUPPLY("VCC_CORE", "pxa3xx-dvm"),
+};
+
+static struct regulator_consumer_supply reg_vsram_supplies[] = {
+	REGULATOR_SUPPLY("VCC_SRAM", "pxa3xx-dvm"),
+};
+
+static struct regulator_init_data reg_vcore_info = {
+	.constraints = {
+		/* ... */
+	},
+	.num_consumer_supplies = ARRAY_SIZE(reg_vcore_supplies),
+	.consumer_supplies = reg_vcore_supplies,
+};
+
+static struct regulator_init_data reg_vsram_info = {
+	.constraints = {
+		/* ... */
+	},
+	.num_consumer_supplies = ARRAY_SIZE(reg_vsram_supplies),
+	.consumer_supplies = reg_vsram_supplies,
+};
+
+Then, register "pxa3xx-dvm" device somewhere (maybe in your machine_init() ?)
+with id -1 and correct platform_data.
