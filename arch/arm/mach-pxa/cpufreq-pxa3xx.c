@@ -177,11 +177,9 @@ static int pxa3xx_cpufreq_dvm(struct pxa3xx_freq_info *freq, int stage)
 		else
 			ret = pxa3xx_dvm_set_vcore(PXA3XX_DVM_VCORE_SUFF);
 	}
-	if(ret)
+	if(ret || !pxa3xx_reg_vsram)
 		return ret;
 
-	if(!pxa3xx_reg_vsram)
-		return 0;
 	vsram = regulator_get_voltage(pxa3xx_reg_vsram);
 	if(_vcomp(req_vsram, vsram)) {
 		if(stage == CPUFREQ_POSTCHANGE)
@@ -189,6 +187,8 @@ static int pxa3xx_cpufreq_dvm(struct pxa3xx_freq_info *freq, int stage)
 		else
 			ret = pxa3xx_dvm_set_vsram(PXA3XX_DVM_VSRAM_SUFF);
 	}
+
+	return ret;
 }
 
 /* cpufreq driver */

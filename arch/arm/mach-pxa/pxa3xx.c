@@ -140,7 +140,7 @@ static struct pxa3xx_wakeup_gpio pxa3xx_gpio_wakeups[] = {};
  *
  * Returns 0 if there are no GPIO wake up sources active, otherwise 1
  */
-static int pxa3xx_gpio_wake_confpins()
+static int pxa3xx_gpio_wake_confpins(void)
 {
 	int ret, pin, wakeupable = 0;
 	unsigned int ec, i;
