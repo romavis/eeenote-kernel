@@ -793,6 +793,18 @@ static void zetablet_power_off(void)
 }
 
 /*
+ * Restart proc (do software GPIO reset)
+ */
+#define PMCR_SWGR (1<<31)
+static void zetablet_restart(char mode, const char* t)
+{
+	if(mode != 'g')
+		pxa_restart(mode, t);
+	/* Generate software GPIO reset */
+	PMCR = PMCR_SWGR;
+}
+
+/*
  * Machine init proc
  */
 static void __init zetablet_init(void)
@@ -874,5 +886,6 @@ MACHINE_START(ETABLET, "ASUS EeeNote")
 	.handle_irq		= pxa3xx_handle_irq,
 	.timer			= &pxa_timer,
 	.init_machine		= zetablet_init,
-	.restart		= pxa_restart,
+	.restart_mode		= 'g',
+	.restart		= zetablet_restart,
 MACHINE_END
